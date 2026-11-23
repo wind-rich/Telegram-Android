@@ -350,7 +350,10 @@ jobs:
           # Prepend Google's Maven Central mirror to avoid Maven Central 429 rate limits on shared CI runners
           cat > /tmp/maven-mirror.init.gradle <<'EOF'
           def mirrorUrl = "https://maven-central.storage-download.googleapis.com/maven2"
-          def prependMirror = { RepositoryHandler repos ->
+          def prependMirrorIfNonEmpty = { RepositoryHandler repos ->
+              if (repos.isEmpty()) {
+                  return
+              }
               def exists = repos.any {
                   it instanceof MavenArtifactRepository &&
                       it.url != null &&
@@ -371,18 +374,25 @@ jobs:
               if (pmRepos.isEmpty()) {
                   pmRepos.gradlePluginPortal()
               }
-              prependMirror(pmRepos)
+              prependMirrorIfNonEmpty(pmRepos)
               if (settings.metaClass.respondsTo(settings, 'getDependencyResolutionManagement')) {
-                  def drRepos = settings.dependencyResolutionManagement.repositories
-                  if (!drRepos.isEmpty()) {
-                      prependMirror(drRepos)
-                  }
+                  prependMirrorIfNonEmpty(settings.dependencyResolutionManagement.repositories)
               }
           }
 
           gradle.beforeProject { proj ->
-              prependMirror(proj.buildscript.repositories)
-              prependMirror(proj.repositories)
+              proj.buildscript.repositories.all { ArtifactRepository repo ->
+                  if (repo instanceof MavenArtifactRepository) {
+                      def u = repo.url?.toString() ?: ""
+                      if (u.startsWith("https://repo.maven.apache.org/maven2") || u.startsWith("https://repo1.maven.org/maven2")) {
+                          repo.url = uri(mirrorUrl)
+                      }
+                  }
+              }
+          }
+
+          gradle.afterProject { proj ->
+              prependMirrorIfNonEmpty(proj.repositories)
           }
           EOF
 
