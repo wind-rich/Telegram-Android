@@ -1,0 +1,150 @@
+name: Sync Upstream & Auto-Build
+
+on:
+  schedule:
+    # Check upstream TelegramMessenger/Telegram-Android every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build and republish even if Release for latest upstream version already exists'
+        required: false
+        default: false
+        type: boolean
+      abi_filters:
+        description: 'Comma-separated ABIs for automatic build'
+        required: false
+        default: 'arm64-v8a'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check & Sync Upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      needs_sync: ${{ steps.check.outputs.needs_sync }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      version_name: ${{ steps.check.outputs.version_name }}
+      version_code: ${{ steps.check.outputs.version_code }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+
+    steps:
+      - name: Check upstream version and fork diff (zero-clone)
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: TelegramMessenger/Telegram-Android
+          FORCE_BUILD: ${{ inputs.force_build || false }}
+        run: |
+          python3 - <<'PY'
+          import os, json, base64, subprocess
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          upstream = os.environ['UPSTREAM_REPO']
+          force_build = os.environ.get('FORCE_BUILD', 'false').lower() == 'true'
+
+          def gh_api(path, allow_404=False):
+              r = subprocess.run(['gh', 'api', path], capture_output=True, text=True)
+              if r.returncode != 0:
+                  if allow_404 and '404' in r.stderr:
+                      return None
+                  raise RuntimeError(f'gh api {path} failed: {r.stderr}')
+              return json.loads(r.stdout)
+
+          up_commit = gh_api(f'repos/{upstream}/commits/master')
+          upstream_sha = up_commit['sha']
+          upstream_msg = up_commit['commit']['message'].splitlines()[0]
+
+          gp_data = gh_api(f'repos/{upstream}/contents/gradle.properties?ref={upstream_sha}')
+          gp_text = base64.b64decode(gp_data['content']).decode('utf-8')
+          props = {}
+          for line in gp_text.splitlines():
+              line = line.strip()
+              if not line or line.startswith('#') or '=' not in line:
+                  continue
+              k, v = line.split('=', 1)
+              props[k.strip()] = v.strip()
+
+          version_name = props['APP_VERSION_NAME']
+          version_code = props['APP_VERSION_CODE']
+          release_tag = f'v{version_name}-{version_code}'
+
+          # Check if upstream/master has commits not yet merged into fork's master
+          cmp_data = gh_api(f'repos/{repo}/compare/master...TelegramMessenger:master')
+          ahead_by = cmp_data.get('ahead_by', 0)
+          needs_sync = ahead_by > 0
+
+          # Check if GitHub Release for this upstream version already exists
+          existing_release = gh_api(f'repos/{repo}/releases/tags/{release_tag}', allow_404=True)
+          should_build = (existing_release is None) or force_build
+
+          print(f'Upstream HEAD : {upstream_sha[:10]} ({upstream_msg})')
+          print(f'Version       : {version_name} ({version_code}) -> tag {release_tag}')
+          print(f'Upstream ahead: {ahead_by} commit(s) -> needs_sync={needs_sync}')
+          print(f'Release exists: {existing_release is not None} -> should_build={should_build}')
+
+          out = {
+              'needs_sync': 'true' if needs_sync else 'false',
+              'should_build': 'true' if should_build else 'false',
+              'upstream_sha': upstream_sha,
+              'version_name': version_name,
+              'version_code': version_code,
+              'release_tag': release_tag,
+          }
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              for k, v in out.items():
+                  f.write(f'{k}={v}\n')
+          PY
+
+      - name: Checkout fork master for merge
+        if: steps.check.outputs.needs_sync == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 50
+          submodules: false
+          token: ${{ secrets.SYNC_PAT || github.token }}
+
+      - name: Merge upstream/master into fork master
+        if: steps.check.outputs.needs_sync == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.check.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/TelegramMessenger/Telegram-Android.git
+          git fetch upstream master --depth=50
+
+          if ! git merge-base HEAD upstream/master >/dev/null 2>&1; then
+            echo "Merge base not within depth 50; deepening history..."
+            git fetch --unshallow origin || true
+            git fetch --unshallow upstream || git fetch upstream master
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git merge --no-edit -X theirs "${UPSTREAM_SHA}"
+          git push origin master
+          echo "Successfully synced fork master with upstream ${UPSTREAM_SHA}."
+
+  build:
+    name: Auto-Build ${{ needs.sync.outputs.version_name }} (${{ needs.sync.outputs.version_code }})
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    uses: ./.github/workflows/build-apk.yml
+    with:
+      git_ref: ${{ needs.sync.outputs.upstream_sha }}
+      abi_filters: ${{ inputs.abi_filters || 'arm64-v8a' }}
+      unobfuscated: true
+      publish_release: true
+      release_tag: ${{ needs.sync.outputs.release_tag }}
+    secrets: inherit
