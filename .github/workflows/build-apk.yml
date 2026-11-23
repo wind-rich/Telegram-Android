@@ -367,9 +367,16 @@ jobs:
           }
 
           gradle.settingsEvaluated { settings ->
-              prependMirror(settings.pluginManagement.repositories)
+              def pmRepos = settings.pluginManagement.repositories
+              if (pmRepos.isEmpty()) {
+                  pmRepos.gradlePluginPortal()
+              }
+              prependMirror(pmRepos)
               if (settings.metaClass.respondsTo(settings, 'getDependencyResolutionManagement')) {
-                  prependMirror(settings.dependencyResolutionManagement.repositories)
+                  def drRepos = settings.dependencyResolutionManagement.repositories
+                  if (!drRepos.isEmpty()) {
+                      prependMirror(drRepos)
+                  }
               }
           }
 
