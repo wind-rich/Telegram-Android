@@ -2,8 +2,8 @@ name: Sync Upstream & Auto-Build
 
 on:
   schedule:
-    # Check upstream TelegramMessenger/Telegram-Android every 15 minutes
-    - cron: '*/15 * * * *'
+    # Check upstream TelegramMessenger/Telegram-Android every 15 minutes (offset from :00/:15/:30/:45 to avoid GitHub cron load spikes)
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       force_build:
