@@ -11,6 +11,11 @@ on:
         required: false
         default: false
         type: boolean
+      variants:
+        description: 'Comma-separated variants for automatic build (release, web, or release,web)'
+        required: false
+        default: 'release,web'
+        type: string
       abi_filters:
         description: 'Comma-separated ABIs for automatic build'
         required: false
@@ -143,6 +148,7 @@ jobs:
     uses: ./.github/workflows/build-apk.yml
     with:
       git_ref: ${{ needs.sync.outputs.upstream_sha }}
+      variants: ${{ inputs.variants || 'release,web' }}
       abi_filters: ${{ inputs.abi_filters || 'arm64-v8a' }}
       unobfuscated: true
       publish_release: true

@@ -8,6 +8,11 @@ on:
         required: false
         default: 'master'
         type: string
+      variants:
+        description: 'Comma-separated variants to build: release (org.telegram.messenger), web (org.telegram.messenger.web), or release,web'
+        required: false
+        default: 'release,web'
+        type: string
       abi_filters:
         description: 'Comma-separated ABIs (e.g. arm64-v8a or armeabi-v7a,arm64-v8a,x86,x86_64)'
         required: false
@@ -36,6 +41,11 @@ on:
         required: false
         default: 'master'
         type: string
+      variants:
+        description: 'Comma-separated variants: release, web, or release,web'
+        required: false
+        default: 'release,web'
+        type: string
       abi_filters:
         description: 'Comma-separated ABIs'
         required: false
@@ -61,12 +71,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-apk-${{ inputs.git_ref || github.sha }}-${{ inputs.abi_filters || 'arm64-v8a' }}
+  group: build-apk-${{ inputs.git_ref || github.sha }}-${{ inputs.variants || 'release,web' }}-${{ inputs.abi_filters || 'arm64-v8a' }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build Release APK (${{ inputs.abi_filters || 'arm64-v8a' }})
+    name: Build APK (${{ inputs.variants || 'release,web' }} / ${{ inputs.abi_filters || 'arm64-v8a' }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -130,6 +140,7 @@ jobs:
       - name: Parse version and toolchain metadata
         id: meta
         env:
+          VARIANTS: ${{ inputs.variants || 'release,web' }}
           ABI_FILTERS: ${{ inputs.abi_filters || 'arm64-v8a' }}
           UNOBFUSCATED: ${{ inputs.unobfuscated }}
           RELEASE_TAG_OVERRIDE: ${{ inputs.release_tag || '' }}
@@ -168,13 +179,20 @@ jobs:
               if m_jdk:
                   jdk_version = m_jdk.group(1)
 
+          variants = [v.strip().lower() for v in os.environ['VARIANTS'].split(',') if v.strip()]
+          valid_variants = {'release', 'web'}
+          assert variants and all(v in valid_variants for v in variants), f'Invalid VARIANTS={variants}; allowed: release, web'
+          build_release = 'release' in variants
+          build_web = 'web' in variants
+
           abis = [a.strip() for a in os.environ['ABI_FILTERS'].split(',') if a.strip()]
           abi_tag = 'afat' if len(abis) > 1 else abis[0]
           unobf = os.environ.get('UNOBFUSCATED', 'true').lower() != 'false'
           obf_suffix = 'unobfuscated' if unobf else 'obfuscated'
 
           release_tag = os.environ.get('RELEASE_TAG_OVERRIDE', '').strip() or f'v{version_name}-{version_code}'
-          apk_name = f'Telegram-v{version_name}-{version_code}-{abi_tag}-{obf_suffix}.apk'
+          release_apk_name = f'Telegram-v{version_name}-{version_code}-{abi_tag}-{obf_suffix}.apk'
+          web_apk_name = f'Telegram-web-v{version_name}-{version_code}-{abi_tag}-{obf_suffix}.apk'
 
           out = {
               'version_name': version_name,
@@ -187,8 +205,11 @@ jobs:
               'jdk_version': jdk_version,
               'abi_tag': abi_tag,
               'need_nasm': 'true' if any(a in ('x86', 'x86_64') for a in abis) else 'false',
+              'build_release': 'true' if build_release else 'false',
+              'build_web': 'true' if build_web else 'false',
               'release_tag': release_tag,
-              'apk_name': apk_name,
+              'release_apk_name': release_apk_name,
+              'web_apk_name': web_apk_name,
           }
 
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
@@ -249,7 +270,7 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle', 'TMessagesProj/build.gradle', 'TMessagesProj_App/build.gradle') }}
+          key: gradle-${{ runner.os }}-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle', 'TMessagesProj/build.gradle', 'TMessagesProj_App/build.gradle', 'TMessagesProj_AppStandalone/build.gradle') }}
           restore-keys: |
             gradle-${{ runner.os }}-
 
@@ -268,8 +289,10 @@ jobs:
             echo "Using repository built-in release.keystore."
           fi
 
-      - name: Patch Gradle config for unobfuscated release & target ABIs (CI only)
+      - name: Patch Gradle config for unobfuscated build & target ABIs (CI only)
         env:
+          BUILD_RELEASE: ${{ steps.meta.outputs.build_release }}
+          BUILD_WEB: ${{ steps.meta.outputs.build_web }}
           ABI_FILTERS: ${{ inputs.abi_filters || 'arm64-v8a' }}
           UNOBFUSCATED: ${{ inputs.unobfuscated }}
         run: |
@@ -277,41 +300,48 @@ jobs:
           import os, re, pathlib
 
           unobf = os.environ.get('UNOBFUSCATED', 'true').lower() != 'false'
+          build_release = os.environ.get('BUILD_RELEASE', 'true').lower() == 'true'
+          build_web = os.environ.get('BUILD_WEB', 'true').lower() == 'true'
           abis = [a.strip() for a in os.environ['ABI_FILTERS'].split(',') if a.strip()]
           assert abis, 'ABI_FILTERS must not be empty'
           abi_groovy = ', '.join(f'"{a}"' for a in abis)
-
-          # 1. Patch TMessagesProj_App/build.gradle
-          app_path = pathlib.Path('TMessagesProj_App/build.gradle')
-          app_text = app_path.read_text(encoding='utf-8')
-
-          if unobf:
-              # Locate buildTypes -> release block (identified by signingConfig signingConfigs.release)
-              def patch_release_block(m):
-                  blk = m.group(0)
-                  blk = re.sub(r'minifyEnabled\s+true', 'minifyEnabled false', blk)
-                  blk = re.sub(r'shrinkResources\s+true', 'shrinkResources false', blk)
-                  return blk
-
-              release_re = re.compile(r'\brelease\s*\{[^{}]*?signingConfig\s+signingConfigs\.release[^{}]*?\}', re.S)
-              new_app_text, count = release_re.subn(patch_release_block, app_text, count=1)
-              if count != 1:
-                  raise RuntimeError(f'Expected to patch exactly 1 buildTypes.release block in TMessagesProj_App/build.gradle, matched {count}')
-              app_text = new_app_text
-
-              # Sanity check: ensure buildTypes.release block keeps debuggable false and disables R8/shrinking
-              m_rel = release_re.search(app_text)
-              assert m_rel and 'debuggable false' in m_rel.group(0), 'buildTypes.release block missing debuggable false!'
-              assert 'minifyEnabled false' in m_rel.group(0), 'buildTypes.release block missing minifyEnabled false!'
-              assert 'shrinkResources false' in m_rel.group(0), 'buildTypes.release block missing shrinkResources false!'
-              assert 'minifyEnabled true' not in m_rel.group(0), 'buildTypes.release block still has minifyEnabled true!'
-              assert 'shrinkResources true' not in m_rel.group(0), 'buildTypes.release block still has shrinkResources true!'
-
-          # Restrict abiFilters in TMessagesProj_App/build.gradle
           abi_re = re.compile(r'abiFilters\s+"[^"\n]+"(?:\s*,\s*"[^"\n]+")*')
-          app_text, abi_count = abi_re.subn(f'abiFilters {abi_groovy}', app_text)
-          assert abi_count >= 1, 'Failed to locate abiFilters in TMessagesProj_App/build.gradle'
-          app_path.write_text(app_text, encoding='utf-8')
+
+          def patch_block(m):
+              blk = m.group(0)
+              blk = re.sub(r'minifyEnabled\s+true', 'minifyEnabled false', blk)
+              blk = re.sub(r'shrinkResources\s+true', 'shrinkResources false', blk)
+              return blk
+
+          def patch_app_module(gradle_file, block_name, expect_suffix=None):
+              p = pathlib.Path(gradle_file)
+              text = p.read_text(encoding='utf-8')
+              if unobf:
+                  block_re = re.compile(
+                      rf'\b{block_name}\s*\{{[^{{}}]*?signingConfig\s+signingConfigs\.release[^{{}}]*?\}}',
+                      re.S,
+                  )
+                  text, count = block_re.subn(patch_block, text, count=1)
+                  if count != 1:
+                      raise RuntimeError(f'Expected 1 buildTypes.{block_name} block in {gradle_file}, matched {count}')
+                  m = block_re.search(text)
+                  assert m and 'debuggable false' in m.group(0), f'{gradle_file} {block_name} missing debuggable false!'
+                  assert 'minifyEnabled false' in m.group(0), f'{gradle_file} {block_name} missing minifyEnabled false!'
+                  assert 'shrinkResources false' in m.group(0), f'{gradle_file} {block_name} missing shrinkResources false!'
+                  assert 'minifyEnabled true' not in m.group(0), f'{gradle_file} {block_name} still has minifyEnabled true!'
+                  assert 'shrinkResources true' not in m.group(0), f'{gradle_file} {block_name} still has shrinkResources true!'
+                  if expect_suffix:
+                      assert f'applicationIdSuffix "{expect_suffix}"' in m.group(0), f'{gradle_file} missing applicationIdSuffix "{expect_suffix}"'
+
+              text, abi_count = abi_re.subn(f'abiFilters {abi_groovy}', text)
+              assert abi_count >= 1, f'Failed to locate abiFilters in {gradle_file}'
+              p.write_text(text, encoding='utf-8')
+
+          # 1. Patch app module(s)
+          if build_release:
+              patch_app_module('TMessagesProj_App/build.gradle', 'release')
+          if build_web:
+              patch_app_module('TMessagesProj_AppStandalone/build.gradle', 'standalone', expect_suffix='.web')
 
           # 2. Restrict CMake/NDK ABIs in library module TMessagesProj/build.gradle so unused ABIs are not compiled
           lib_path = pathlib.Path('TMessagesProj/build.gradle')
@@ -335,10 +365,12 @@ jobs:
           PY
 
           echo "=== CI-only Gradle patch diff ==="
-          git diff -- TMessagesProj/build.gradle TMessagesProj_App/build.gradle gradle.properties
+          git diff -- TMessagesProj/build.gradle TMessagesProj_App/build.gradle TMessagesProj_AppStandalone/build.gradle gradle.properties
 
-      - name: Build :TMessagesProj_App:assembleAfatRelease
+      - name: Build selected Gradle APK task(s)
         env:
+          BUILD_RELEASE: ${{ steps.meta.outputs.build_release }}
+          BUILD_WEB: ${{ steps.meta.outputs.build_web }}
           CUSTOM_SIGNING: ${{ steps.signing.outputs.custom }}
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
@@ -396,6 +428,11 @@ jobs:
           }
           EOF
 
+          TASKS=()
+          [ "${BUILD_RELEASE}" = "true" ] && TASKS+=(":TMessagesProj_App:assembleAfatRelease")
+          [ "${BUILD_WEB}" = "true" ] && TASKS+=(":TMessagesProj_AppStandalone:assembleAfatStandalone")
+          echo "Gradle tasks: ${TASKS[*]}"
+
           EXTRA_ARGS=()
           if [ "${CUSTOM_SIGNING}" = "true" ]; then
             [ -n "${RELEASE_STORE_PASSWORD}" ] && EXTRA_ARGS+=("-PRELEASE_STORE_PASSWORD=${RELEASE_STORE_PASSWORD}")
@@ -404,7 +441,7 @@ jobs:
           fi
 
           for attempt in 1 2; do
-            if ./gradlew --init-script /tmp/maven-mirror.init.gradle :TMessagesProj_App:assembleAfatRelease --no-daemon --stacktrace "${EXTRA_ARGS[@]}"; then
+            if ./gradlew --init-script /tmp/maven-mirror.init.gradle "${TASKS[@]}" --no-daemon --stacktrace "${EXTRA_ARGS[@]}"; then
               break
             fi
             if [ "${attempt}" -eq 2 ]; then
@@ -415,10 +452,13 @@ jobs:
             sleep 15
           done
 
-      - name: Verify APK (unobfuscated DEX gate, ABI, package, signature)
+      - name: Verify APK(s) (unobfuscated DEX gate, ABI, package, signature)
         id: verify
         env:
-          APK_NAME: ${{ steps.meta.outputs.apk_name }}
+          BUILD_RELEASE: ${{ steps.meta.outputs.build_release }}
+          BUILD_WEB: ${{ steps.meta.outputs.build_web }}
+          RELEASE_APK_NAME: ${{ steps.meta.outputs.release_apk_name }}
+          WEB_APK_NAME: ${{ steps.meta.outputs.web_apk_name }}
           VERSION_NAME: ${{ steps.meta.outputs.version_name }}
           VERSION_CODE: ${{ steps.meta.outputs.version_code }}
           APP_PACKAGE: ${{ steps.meta.outputs.app_package }}
@@ -426,125 +466,150 @@ jobs:
           ABI_FILTERS: ${{ inputs.abi_filters || 'arm64-v8a' }}
           UNOBFUSCATED: ${{ inputs.unobfuscated }}
         run: |
-          set -euo pipefail
-          mkdir -p dist
-          RAW_APK=$(find TMessagesProj_App/build/outputs/apk/afat/release -maxdepth 2 -name '*.apk' | head -n 1)
-          if [ -z "${RAW_APK}" ] || [ ! -f "${RAW_APK}" ]; then
-            echo "::error::Built APK not found under TMessagesProj_App/build/outputs/apk/afat/release"
-            exit 1
-          fi
-
-          OUT_APK="dist/${APK_NAME}"
-          cp "${RAW_APK}" "${OUT_APK}"
-
-          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          AAPT2="${SDK_ROOT}/build-tools/${BUILD_TOOLS}/aapt2"
-          APKSIGNER="${SDK_ROOT}/build-tools/${BUILD_TOOLS}/apksigner"
-
-          echo "=== aapt2 dump badging ==="
-          BADGING=$("${AAPT2}" dump badging "${OUT_APK}")
-          echo "${BADGING}" | head -n 20
-
-          echo "${BADGING}" | grep -q "package: name='${APP_PACKAGE}'" || { echo "::error::Package name mismatch!"; exit 1; }
-          echo "${BADGING}" | grep -q "versionName='${VERSION_NAME}'" || { echo "::error::versionName mismatch!"; exit 1; }
-          if echo "${BADGING}" | grep -q "application-debuggable"; then
-            echo "::error::APK must NOT be debuggable!"
-            exit 1
-          fi
-
-          APK_VERSION_CODE=$(echo "${BADGING}" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -n 1)
-          echo "apk_version_code=${APK_VERSION_CODE}" >> "$GITHUB_OUTPUT"
-
-          echo "=== apksigner verify ==="
-          SIGN_OUT=$("${APKSIGNER}" verify --verbose --print-certs "${OUT_APK}")
-          echo "${SIGN_OUT}"
-          CERT_SHA256=$(echo "${SIGN_OUT}" | grep -m 1 'Signer #1 certificate SHA-256 digest:' | awk '{print $NF}')
-          echo "cert_sha256=${CERT_SHA256}" >> "$GITHUB_OUTPUT"
-
           python3 - <<'PY'
-          import os, struct, zipfile, pathlib
+          import hashlib, json, os, pathlib, re, shutil, struct, subprocess, zipfile
 
-          apk_path = pathlib.Path('dist') / os.environ['APK_NAME']
+          dist_dir = pathlib.Path('dist')
+          dist_dir.mkdir(parents=True, exist_ok=True)
+
+          sdk_root = pathlib.Path(os.environ.get('ANDROID_HOME', '/usr/local/lib/android/sdk'))
+          bt = os.environ['BUILD_TOOLS']
+          aapt2 = str(sdk_root / 'build-tools' / bt / 'aapt2')
+          apksigner = str(sdk_root / 'build-tools' / bt / 'apksigner')
+
+          version_name = os.environ['VERSION_NAME']
+          app_package = os.environ['APP_PACKAGE']
           expected_abis = {a.strip() for a in os.environ['ABI_FILTERS'].split(',') if a.strip()}
           unobf = os.environ.get('UNOBFUSCATED', 'true').lower() != 'false'
 
-          with zipfile.ZipFile(apk_path, 'r') as zf:
-              names = zf.namelist()
-              found_abis = set()
-              so_files = []
-              for n in names:
-                  if n.startswith('lib/') and n.endswith('.so'):
-                      parts = n.split('/')
-                      if len(parts) >= 3:
-                          found_abis.add(parts[1])
-                          so_files.append(n)
-              print('Native libraries:', sorted(so_files))
-              assert found_abis == expected_abis, f'ABI mismatch! expected={expected_abis}, found={found_abis}'
-              assert any('libtmessages.' in s for s in so_files), 'Missing libtmessages*.so!'
+          targets = []
+          if os.environ.get('BUILD_RELEASE', 'false').lower() == 'true':
+              targets.append({
+                  'key': 'release',
+                  'label': 'Release',
+                  'gradle_task': 'TMessagesProj_App:assembleAfatRelease',
+                  'search_dir': pathlib.Path('TMessagesProj_App/build/outputs/apk/afat/release'),
+                  'mapping_file': pathlib.Path('TMessagesProj_App/build/outputs/mapping/afatRelease/mapping.txt'),
+                  'expected_pkg': app_package,
+                  'out_name': os.environ['RELEASE_APK_NAME'],
+              })
+          if os.environ.get('BUILD_WEB', 'false').lower() == 'true':
+              targets.append({
+                  'key': 'web',
+                  'label': 'Standalone (.web)',
+                  'gradle_task': 'TMessagesProj_AppStandalone:assembleAfatStandalone',
+                  'search_dir': pathlib.Path('TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone'),
+                  'mapping_file': pathlib.Path('TMessagesProj_AppStandalone/build/outputs/mapping/afatStandalone/mapping.txt'),
+                  'expected_pkg': f'{app_package}.web',
+                  'out_name': os.environ['WEB_APK_NAME'],
+              })
 
-              dex_files = sorted(n for n in names if n.startswith('classes') and n.endswith('.dex'))
-              print('DEX files:', dex_files)
-              assert dex_files, 'No DEX files found in APK!'
+          def read_uleb128(buf, pos):
+              res = 0
+              shift = 0
+              while True:
+                  b = buf[pos]
+                  pos += 1
+                  res |= (b & 0x7F) << shift
+                  if (b & 0x80) == 0:
+                      break
+                  shift += 7
+              return res, pos
 
-              if unobf:
-                  mapping_file = pathlib.Path('TMessagesProj_App/build/outputs/mapping/afatRelease/mapping.txt')
-                  assert not mapping_file.exists(), 'R8 mapping.txt exists — APK was processed by R8!'
+          summary = []
+          for t in targets:
+              apks = sorted(t['search_dir'].glob('*.apk'))
+              assert apks, f"Built APK not found under {t['search_dir']}"
+              out_apk = dist_dir / t['out_name']
+              shutil.copy2(apks[0], out_apk)
+              print(f"\n================ Verifying {t['label']}: {out_apk} ================")
 
-                  all_strings = set()
+              badging = subprocess.check_output([aapt2, 'dump', 'badging', str(out_apk)], text=True, encoding='utf-8', errors='replace')
+              print('\n'.join(badging.splitlines()[:12]))
+              assert f"package: name='{t['expected_pkg']}'" in badging, f"Package name mismatch for {t['label']}!"
+              assert f"versionName='{version_name}'" in badging, f"versionName mismatch for {t['label']}!"
+              assert 'application-debuggable' not in badging, f"{t['label']} APK must NOT be debuggable!"
+              m_vc = re.search(r"versionCode='(\d+)'", badging)
+              apk_version_code = m_vc.group(1) if m_vc else ''
+
+              sign_out = subprocess.check_output([apksigner, 'verify', '--verbose', '--print-certs', str(out_apk)], text=True, encoding='utf-8', errors='replace')
+              print(sign_out)
+              m_cert = re.search(r'Signer #1 certificate SHA-256 digest:\s*([0-9a-fA-F]+)', sign_out)
+              cert_sha256 = m_cert.group(1) if m_cert else ''
+
+              with zipfile.ZipFile(out_apk, 'r') as zf:
+                  names = zf.namelist()
+                  found_abis = set()
+                  so_files = []
+                  for n in names:
+                      if n.startswith('lib/') and n.endswith('.so'):
+                          parts = n.split('/')
+                          if len(parts) >= 3:
+                              found_abis.add(parts[1])
+                              so_files.append(n)
+                  print('Native libraries:', sorted(so_files))
+                  assert found_abis == expected_abis, f"ABI mismatch for {t['label']}! expected={expected_abis}, found={found_abis}"
+                  assert any('libtmessages.' in s for s in so_files), f"Missing libtmessages*.so in {t['label']}!"
+
+                  dex_files = sorted(n for n in names if n.startswith('classes') and n.endswith('.dex'))
+                  print('DEX files:', dex_files)
+                  assert dex_files, f"No DEX files found in {t['label']}!"
+
                   tg_classes = set()
+                  if unobf:
+                      assert not t['mapping_file'].exists(), f"R8 mapping.txt exists at {t['mapping_file']} — {t['label']} was processed by R8!"
+                      all_strings = set()
+                      for dex_name in dex_files:
+                          data = zf.read(dex_name)
+                          assert data[:4] == b'dex\n', f'Invalid DEX header in {dex_name}'
+                          str_size, str_off = struct.unpack_from('<II', data, 56)
+                          for i in range(str_size):
+                              s_off = struct.unpack_from('<I', data, str_off + i * 4)[0]
+                              _, p = read_uleb128(data, s_off)
+                              end = data.index(0, p)
+                              s = data[p:end].decode('utf-8', errors='ignore')
+                              all_strings.add(s)
+                              if s.startswith('Lorg/telegram/') and s.endswith(';'):
+                                  tg_classes.add(s)
 
-                  def read_uleb128(buf, pos):
-                      res = 0
-                      shift = 0
-                      while True:
-                          b = buf[pos]
-                          pos += 1
-                          res |= (b & 0x7F) << shift
-                          if (b & 0x80) == 0:
-                              break
-                          shift += 7
-                      return res, pos
+                      print(f"Total unobfuscated Lorg/telegram/* descriptors in {t['label']}: {len(tg_classes)}")
+                      required_classes = [
+                          'Lorg/telegram/ui/ChatActivity;',
+                          'Lorg/telegram/ui/DialogsActivity;',
+                          'Lorg/telegram/ui/LaunchActivity;',
+                          'Lorg/telegram/messenger/MessagesController;',
+                          'Lorg/telegram/messenger/SendMessagesHelper;',
+                          'Lorg/telegram/messenger/MessageObject;',
+                      ]
+                      missing_cls = [c for c in required_classes if c not in tg_classes]
+                      assert not missing_cls, f"Missing unobfuscated classes in {t['label']}: {missing_cls}"
+                      missing_m = [m for m in ('processUpdateArray', 'sendMessage') if m not in all_strings]
+                      assert not missing_m, f"Missing unobfuscated methods in {t['label']}: {missing_m}"
+                      assert len(tg_classes) >= 2000, f"Too few Lorg/telegram/* classes ({len(tg_classes)}) in {t['label']}!"
+                      print(f"UNOBFUSCATED DEX VERIFICATION PASSED for {t['label']}!")
 
-                  for dex_name in dex_files:
-                      data = zf.read(dex_name)
-                      assert data[:4] == b'dex\n', f'Invalid DEX header in {dex_name}'
-                      str_size, str_off = struct.unpack_from('<II', data, 56)
-                      for i in range(str_size):
-                          s_off = struct.unpack_from('<I', data, str_off + i * 4)[0]
-                          _, p = read_uleb128(data, s_off)
-                          end = data.index(0, p)
-                          s = data[p:end].decode('utf-8', errors='ignore')
-                          all_strings.add(s)
-                          if s.startswith('Lorg/telegram/') and s.endswith(';'):
-                              tg_classes.add(s)
+              sha256 = hashlib.sha256(out_apk.read_bytes()).hexdigest()
+              (dist_dir / f"{t['out_name']}.sha256").write_text(f"{sha256}  {t['out_name']}\n", encoding='utf-8')
+              size_mib = out_apk.stat().st_size / (1024 * 1024)
+              summary.append({
+                  'key': t['key'],
+                  'label': t['label'],
+                  'gradle_task': t['gradle_task'],
+                  'package': t['expected_pkg'],
+                  'apk_name': t['out_name'],
+                  'size': f'{size_mib:.2f} MiB',
+                  'apk_version_code': apk_version_code,
+                  'dex_tg_classes': len(tg_classes),
+                  'sha256': sha256,
+                  'cert_sha256': cert_sha256,
+              })
 
-                  print(f'Total unobfuscated Lorg/telegram/* descriptors in DEX: {len(tg_classes)}')
-                  required_classes = [
-                      'Lorg/telegram/ui/ChatActivity;',
-                      'Lorg/telegram/ui/DialogsActivity;',
-                      'Lorg/telegram/ui/LaunchActivity;',
-                      'Lorg/telegram/messenger/MessagesController;',
-                      'Lorg/telegram/messenger/SendMessagesHelper;',
-                      'Lorg/telegram/messenger/MessageObject;',
-                  ]
-                  missing_cls = [c for c in required_classes if c not in tg_classes]
-                  assert not missing_cls, f'Missing unobfuscated classes (APK appears obfuscated!): {missing_cls}'
-
-                  required_methods = ['processUpdateArray', 'sendMessage']
-                  missing_m = [m for m in required_methods if m not in all_strings]
-                  assert not missing_m, f'Missing unobfuscated method names: {missing_m}'
-                  assert len(tg_classes) >= 2000, f'Too few Lorg/telegram/* classes ({len(tg_classes)}), APK may be shrunk/obfuscated!'
-                  print('UNOBFUSCATED DEX VERIFICATION PASSED!')
+          (dist_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print('\n=== Verification Summary ===')
+          print(json.dumps(summary, indent=2))
           PY
 
-          (cd dist && sha256sum "${APK_NAME}" > "${APK_NAME}.sha256")
-          APK_SHA256=$(awk '{print $1}' "dist/${APK_NAME}.sha256")
-          APK_SIZE=$(du -h "${OUT_APK}" | awk '{print $1}')
-          echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
-          echo "apk_size=${APK_SIZE}" >> "$GITHUB_OUTPUT"
-          echo "APK verified: ${OUT_APK} (${APK_SIZE}, SHA-256: ${APK_SHA256})"
-
-      - name: Upload APK build artifact
+      - name: Upload APK build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.release_tag }}-${{ steps.meta.outputs.abi_tag }}
@@ -560,20 +625,13 @@ jobs:
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
           VERSION_NAME: ${{ steps.meta.outputs.version_name }}
           VERSION_CODE: ${{ steps.meta.outputs.version_code }}
-          APK_VERSION_CODE: ${{ steps.verify.outputs.apk_version_code }}
-          APP_PACKAGE: ${{ steps.meta.outputs.app_package }}
           ABI_FILTERS: ${{ inputs.abi_filters || 'arm64-v8a' }}
-          APK_NAME: ${{ steps.meta.outputs.apk_name }}
-          APK_SIZE: ${{ steps.verify.outputs.apk_size }}
-          APK_SHA256: ${{ steps.verify.outputs.apk_sha256 }}
-          CERT_SHA256: ${{ steps.verify.outputs.cert_sha256 }}
           COMMIT_SHA: ${{ steps.ref.outputs.sha }}
           SHORT_SHA: ${{ steps.ref.outputs.short_sha }}
           UNOBFUSCATED: ${{ inputs.unobfuscated }}
         run: |
           set -euo pipefail
 
-          # Determine if this versionCode is the highest among all published releases
           IS_LATEST=$(python3 - <<'PY'
           import os, re, json, subprocess
           cur = int(os.environ['VERSION_CODE'])
@@ -588,24 +646,45 @@ jobs:
           PY
           )
 
-          cat > release_notes.md <<EOF
-          ## Telegram Android ${VERSION_NAME} (${VERSION_CODE}) — Unobfuscated Release
+          python3 - <<'PY'
+          import json, os, pathlib
 
-          - **Upstream Commit**: [\`${SHORT_SHA}\`](https://github.com/TelegramMessenger/Telegram-Android/commit/${COMMIT_SHA})
-          - **Package Name**: \`${APP_PACKAGE}\`
-          - **Version**: \`${VERSION_NAME}\` (base code \`${VERSION_CODE}\`, APK versionCode \`${APK_VERSION_CODE}\`)
-          - **Build Variant**: \`TMessagesProj_App:assembleAfatRelease\` (\`debuggable=false\`)
-          - **Obfuscation**: Disabled (\`minifyEnabled=false\`, \`shrinkResources=false\`, DEX unobfuscation verified)
-          - **ABI**: \`${ABI_FILTERS}\`
-          - **APK File**: \`${APK_NAME}\` (${APK_SIZE})
-          - **APK SHA-256**: \`${APK_SHA256}\`
-          - **Signing Cert SHA-256**: \`${CERT_SHA256}\`
-          EOF
+          summary = json.loads(pathlib.Path('dist/summary.json').read_text(encoding='utf-8'))
+          version_name = os.environ['VERSION_NAME']
+          version_code = os.environ['VERSION_CODE']
+          abi_filters = os.environ['ABI_FILTERS']
+          commit_sha = os.environ['COMMIT_SHA']
+          short_sha = os.environ['SHORT_SHA']
+          unobf = os.environ.get('UNOBFUSCATED', 'true').lower() != 'false'
+          cert = summary[0]['cert_sha256'] if summary else ''
 
+          lines = [
+              f'## Telegram Android {version_name} ({version_code}) — Unobfuscated Release',
+              '',
+              f'- **Upstream Commit**: [`{short_sha}`](https://github.com/TelegramMessenger/Telegram-Android/commit/{commit_sha})',
+              f'- **Version**: `{version_name}` (base code `{version_code}`)',
+              f'- **ABI**: `{abi_filters}`',
+              f'- **Obfuscation**: {"Disabled (`minifyEnabled=false`, `shrinkResources=false`, DEX unobfuscation verified)" if unobf else "Enabled"}',
+              f'- **Debuggable**: `false`',
+              f'- **Signing Cert SHA-256**: `{cert}`',
+              '',
+              '### Artifacts',
+              '',
+              '| Variant | Package Name | APK File | Size | VersionCode | Unobfuscated DEX Classes | SHA-256 |',
+              '| :--- | :--- | :--- | :--- | :--- | :--- | :--- |',
+          ]
+          for item in summary:
+              lines.append(
+                  f"| {item['label']} | `{item['package']}` | `{item['apk_name']}` | {item['size']} | `{item['apk_version_code']}` | {item['dex_tg_classes']} | `{item['sha256']}` |"
+              )
+          pathlib.Path('release_notes.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+
+          ASSETS=(dist/*.apk dist/*.apk.sha256)
           TITLE="Telegram Android ${VERSION_NAME} (${VERSION_CODE}) - Unobfuscated"
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Release ${RELEASE_TAG} already exists; updating assets and notes..."
-            gh release upload "${RELEASE_TAG}" "dist/${APK_NAME}" "dist/${APK_NAME}.sha256" --clobber
+            echo "Release ${RELEASE_TAG} already exists; uploading assets and updating notes..."
+            gh release upload "${RELEASE_TAG}" "${ASSETS[@]}" --clobber
             if [ "${IS_LATEST}" = "true" ]; then
               gh release edit "${RELEASE_TAG}" --title "${TITLE}" --notes-file release_notes.md --latest
             else
@@ -614,7 +693,7 @@ jobs:
           else
             echo "Creating Release ${RELEASE_TAG} (latest=${IS_LATEST})..."
             gh release create "${RELEASE_TAG}" \
-              "dist/${APK_NAME}" "dist/${APK_NAME}.sha256" \
+              "${ASSETS[@]}" \
               --target "${COMMIT_SHA}" \
               --title "${TITLE}" \
               --notes-file release_notes.md \
